@@ -1,0 +1,3 @@
+[submodule "insta-updates-bot"]
+	path = insta-updates-bot
+	url = https://github.com/mitrabeast/insta-updates-bot

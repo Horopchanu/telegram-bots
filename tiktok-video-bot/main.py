@@ -2,16 +2,17 @@ import hashlib
 import logging
 import os
 import random
-import re
 import string
+from urllib.parse import unquote
 
-import aiofiles as aiofiles
-import aiohttp
+from aiogram.types.inline_keyboard import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types.inline_query_result import InlineQueryResultVideo
+from aiogram.types.input_media import InputMediaVideo
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineQuery, InputTextMessageContent, \
-    InlineQueryResultArticle, ChosenInlineResult, InputMedia
+    InlineQueryResultArticle, ChosenInlineResult
 from aiogram.utils import executor
-from aiohttp import ClientError
+import aiohttp
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox import webdriver
@@ -29,6 +30,7 @@ dp = Dispatcher(bot)
 async def fetch_tiktok_video(link) -> dict:
     log.info(f'Fetching TikTok video from {link} ...')
 
+    service_url = "https://snaptik.app/"
     tiktok_video = dict()
 
     webdriver_options = Options()
@@ -36,43 +38,60 @@ async def fetch_tiktok_video(link) -> dict:
 
     with webdriver.WebDriver(options=webdriver_options) as driver:
         try:
-            driver.get(link)
+            driver.get(service_url)
             wait = WebDriverWait(driver, 3)
-            wait.until(EC.visibility_of_element_located((By.ID, "main")))
+            wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#url"))).send_keys(link)
+            driver.find_element_by_id('submiturl').click()
+            wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.is-success")))
         except Exception as e:
             log.error(f'Error loading TikTok video page {link}: {e}')
             driver.save_screenshot('screenshot.png')
 
         soup = BeautifulSoup(driver.page_source, "html.parser")
-        title = soup.find('a', attrs={'class': 'user-avatar'})
-        if title:
-            tiktok_video['title'] = title.get('title')
 
-        user_avatar = soup.find('span', attrs={'class': 'tiktok-avatar'})
+        user_avatar = soup.find('img', attrs={'class': 'lazy'})
         if user_avatar:
-            for avatar in user_avatar.children:
-                tiktok_video['thumb'] = avatar.get('src')
+            tiktok_video['title'] = user_avatar.get('alt')
+            tiktok_video['thumb'] = user_avatar.get('src')
 
-        video = soup.find('video', attrs={'class': 'video-player'})
+        video = soup.find('a', attrs={'class': 'is-success'})
         if video:
-            video_url = video.get('src')
-            if video_url:
-                tiktok_video['video'] = video_url
-                mime_type_match = re.search('mime_type=\\w+', video_url)
-                if mime_type_match:
-                    mime_type = mime_type_match.group().split('=')[1:]
-                    mime_type = mime_type[0] if mime_type else str()
-                    tiktok_video['mime'] = mime_type.replace('_', '/')
+            tiktok_video['mime'] = 'video/mp4'
+            video_url = video.get('href')
+            if video_url and not video_url.startswith('http'):
+                video_url = service_url + video_url
+            tiktok_video['video'] = unquote(video_url)
 
     log.info(f'Got TikTok video from {link}: {tiktok_video}')
 
     return tiktok_video
 
 
+async def download_video(url):
+    filename = f"videos/{''.join(random.choice(string.ascii_lowercase) for i in range(32))}.mp4"
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                video_bytes = await response.read()
+                with open(filename, "wb") as video_file:
+                    video_file.write(video_bytes)
+    except Exception as ex:
+        log.error(f'Error downloading video from {url}: {ex}')
+
+    return filename
+
+async def remove_video(filename):
+    if os.path.exists(filename):
+        os.remove(filename)
+        log.info(f'Removed video: {filename}')
+    else:
+        log.warning(f'Trying to remove not existing video: {filename}')
+
+
 @dp.message_handler(commands=['start', 'help'])
 async def send_welcome(message: types.Message):
-    await message.answer("Send me link to TikTok video & I will download and "
-                         "send it back to you.")
+    await message.answer("Send me link to TikTok video & I will download and send it back to you.")
 
 
 @dp.message_handler()
@@ -84,8 +103,7 @@ async def send_video(message: types.Message):
             chat_id=message.chat.id,
             video=tiktok_video.get('video'),
             caption=tiktok_video.get('title', 'TikTok Video'),
-            reply_to_message_id=message.message_id
-        )
+            reply_to_message_id=message.message_id)
 
 
 @dp.inline_handler()
@@ -94,33 +112,49 @@ async def select_inline_video(inline_query: InlineQuery):
     if link:
         input_content = InputTextMessageContent(link)
         result_id: str = hashlib.md5(link.encode()).hexdigest()
+        inline_keyboard = [[InlineKeyboardButton(text='Downloading...', callback_data='downloading')]]
         item = InlineQueryResultArticle(
             id=result_id,
             title=f'TikTok video {link}',
             input_message_content=input_content,
-        )
-        await bot.answer_inline_query(inline_query.id, results=[item],
-                                      cache_time=1)
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=inline_keyboard))
+        await bot.answer_inline_query(inline_query.id, results=[item], cache_time=1)
 
 
 @dp.chosen_inline_handler()
 async def send_chosen_inline_video(chosen_inline_result: ChosenInlineResult):
     link = chosen_inline_result.query
-    message_id = chosen_inline_result.from_user.id
-    if link and message_id:
-        tiktok_video = await fetch_tiktok_video(link)
-        await bot.send_video(
-            chat_id=message_id,
-            video=tiktok_video.get('video'),
-            thumb=tiktok_video.get('thumb'),
-            caption=tiktok_video.get('title')
-        )
+    message_id = chosen_inline_result.inline_message_id
+    if not link or not message_id:
+        return
+
+    tiktok_video = await fetch_tiktok_video(link)
+    if not tiktok_video.get('video'):
+        await bot.edit_message_text(f'No video found on: {link}')
+        return
+
+    await bot.edit_message_text('Not accessible for now.')
+    # TOOD: uncomment when telegram will allow send video as the response for inline query
+    # filename = await download_video(tiktok_video['video'])
+    # try:
+    #     with open(filename, 'rb') as video:
+    #         media = InputMediaVideo(media=video, thumb=tiktok_video.get('thumb'), caption=tiktok_video.get('title'))
+    #         await bot.edit_message_media(media, inline_message_id=message_id)
+    # except Exception as ex:
+    #     log.error(f'Error uploading video: {ex}')
+    # finally:
+    #     await remove_video(filename)
 
 
 if __name__ == '__main__':
-    # executor.start_polling(dp, skip_updates=True)
+    executor.start_polling(dp, skip_updates=True)
 
-    import asyncio
-    test_link = 'https://vm.tiktok.com/ZMdRSxBL7/'
-    test_tiktok_video = asyncio.run(fetch_tiktok_video(test_link))
-    print(test_tiktok_video)
+    # import asyncio
+    # import time
+    # test_link = 'https://vm.tiktok.com/ZMdRSxBL7/'
+    # test_tiktok_video = asyncio.run(fetch_tiktok_video(test_link))
+    # print(test_tiktok_video)
+    # filename = asyncio.run(download_video(test_tiktok_video.get('video')))
+    # print(filename)
+    # # time.sleep(1000)
+    # asyncio.run(remove_video(filename))

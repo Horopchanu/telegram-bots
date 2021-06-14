@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import string
+import traceback
 from urllib.parse import unquote
 
 from aiogram.types.inline_keyboard import InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,8 +16,8 @@ from aiogram.utils import executor
 import aiohttp
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
-from selenium.webdriver.firefox import webdriver
-from selenium.webdriver.firefox.options import Options
+from selenium.webdriver.chrome import webdriver
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.wait import WebDriverWait
 
@@ -35,26 +36,32 @@ async def fetch_tiktok_video(link) -> dict:
 
     webdriver_options = Options()
     webdriver_options.headless = True
+    webdriver_options.binary_location = os.environ.get('GOOGLE_CHROME_SHIM', None)
 
-    with webdriver.WebDriver(options=webdriver_options) as driver:
+    with webdriver.WebDriver(executable_path="chromedriver", options=webdriver_options) as driver:
         try:
             driver.get(service_url)
-            wait = WebDriverWait(driver, 3)
+            wait = WebDriverWait(driver, 5)
             wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "input#url"))).send_keys(link)
             driver.find_element_by_id('submiturl').click()
-            wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, "a.is-success")))
+            wait = WebDriverWait(driver, 5)
+            wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "a.is-success")))
         except Exception as e:
             log.error(f'Error loading TikTok video page {link}: {e}')
+            traceback.print_exc()
             driver.save_screenshot('screenshot.png')
 
         soup = BeautifulSoup(driver.page_source, "html.parser")
+        log.info(f'Loaded service page: {soup}')
 
         user_avatar = soup.find('img', attrs={'class': 'lazy'})
+        log.info(f'User avatar tag: {user_avatar}')
         if user_avatar:
             tiktok_video['title'] = user_avatar.get('alt')
             tiktok_video['thumb'] = user_avatar.get('src')
 
         video = soup.find('a', attrs={'class': 'is-success'})
+        log.info(f'Video link tag: {video}')
         if video:
             tiktok_video['mime'] = 'video/mp4'
             video_url = video.get('href')
@@ -99,11 +106,12 @@ async def send_video(message: types.Message):
     link = message.text
     if link:
         tiktok_video = await fetch_tiktok_video(link)
-        await bot.send_video(
-            chat_id=message.chat.id,
-            video=tiktok_video.get('video'),
-            caption=tiktok_video.get('title', 'TikTok Video'),
-            reply_to_message_id=message.message_id)
+        if tiktok_video.get('video'):
+            await bot.send_video(
+                chat_id=message.chat.id, video=tiktok_video['video'],
+                caption=tiktok_video.get('title'), reply_to_message_id=message.message_id)
+        else:
+            await message.reply('Cannot load video.')
 
 
 @dp.inline_handler()
@@ -114,9 +122,7 @@ async def select_inline_video(inline_query: InlineQuery):
         result_id: str = hashlib.md5(link.encode()).hexdigest()
         inline_keyboard = [[InlineKeyboardButton(text='Downloading...', callback_data='downloading')]]
         item = InlineQueryResultArticle(
-            id=result_id,
-            title=f'TikTok video {link}',
-            input_message_content=input_content,
+            id=result_id, title=f'TikTok video {link}', input_message_content=input_content,
             reply_markup=InlineKeyboardMarkup(inline_keyboard=inline_keyboard))
         await bot.answer_inline_query(inline_query.id, results=[item], cache_time=1)
 
